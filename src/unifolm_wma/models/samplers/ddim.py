@@ -239,6 +239,9 @@ class DDIMSampler(object):
 
         clean_cond = kwargs.pop("clean_cond", False)
 
+        # Determine autocast context based on precision
+        use_amp = (precision is not None and precision == 16)
+
         dp_ddim_scheduler_action.set_timesteps(len(timesteps))
         dp_ddim_scheduler_state.set_timesteps(len(timesteps))
         for i, step in enumerate(iterator):
@@ -254,41 +257,42 @@ class DDIMSampler(object):
                     img_orig = self.model.q_sample(x0, ts)
                 img = img_orig * mask + (1. - mask) * img
 
-            outs = self.p_sample_ddim(
-                img,
-                action,
-                state,
-                cond,
-                ts,
-                index=index,
-                use_original_steps=ddim_use_original_steps,
-                quantize_denoised=quantize_denoised,
-                temperature=temperature,
-                noise_dropout=noise_dropout,
-                score_corrector=score_corrector,
-                corrector_kwargs=corrector_kwargs,
-                unconditional_guidance_scale=unconditional_guidance_scale,
-                unconditional_conditioning=unconditional_conditioning,
-                mask=mask,
-                x0=x0,
-                fs=fs,
-                guidance_rescale=guidance_rescale,
-                **kwargs)
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+                outs = self.p_sample_ddim(
+                    img,
+                    action,
+                    state,
+                    cond,
+                    ts,
+                    index=index,
+                    use_original_steps=ddim_use_original_steps,
+                    quantize_denoised=quantize_denoised,
+                    temperature=temperature,
+                    noise_dropout=noise_dropout,
+                    score_corrector=score_corrector,
+                    corrector_kwargs=corrector_kwargs,
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    unconditional_conditioning=unconditional_conditioning,
+                    mask=mask,
+                    x0=x0,
+                    fs=fs,
+                    guidance_rescale=guidance_rescale,
+                    **kwargs)
 
             img, pred_x0, model_output_action, model_output_state = outs
 
             action = dp_ddim_scheduler_action.step(
-                model_output_action,
+                model_output_action.float(),
                 step,
-                action,
+                action.float(),
                 generator=None,
-            ).prev_sample
+            ).prev_sample.to(img.dtype)
             state = dp_ddim_scheduler_state.step(
-                model_output_state,
+                model_output_state.float(),
                 step,
-                state,
+                state.float(),
                 generator=None,
-            ).prev_sample
+            ).prev_sample.to(img.dtype)
 
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)

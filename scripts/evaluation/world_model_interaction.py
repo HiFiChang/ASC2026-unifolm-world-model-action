@@ -25,6 +25,11 @@ from PIL import Image
 from unifolm_wma.models.samplers.ddim import DDIMSampler
 from unifolm_wma.utils.utils import instantiate_from_config
 
+# ============ CUDA Backend Optimizations ============
+torch.backends.cudnn.benchmark = True          # Auto-tune convolution algorithms
+torch.backends.cuda.matmul.allow_tf32 = True   # Allow TF32 for matmul (A100)
+torch.backends.cudnn.allow_tf32 = True         # Allow TF32 for cuDNN (A100)
+
 
 def get_device_from_parameters(module: nn.Module) -> torch.device:
     """Get a module's device by checking one of its parameters.
@@ -363,14 +368,16 @@ def image_guided_synthesis_sim_mode(
 
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
-    img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
-    cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
-    cond_img_emb = model.embedder(cond_img)
-    cond_img_emb = model.image_proj_model(cond_img_emb)
+    # Use autocast for FP16 conditioning computation
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
+        cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
+        cond_img_emb = model.embedder(cond_img)
+        cond_img_emb = model.image_proj_model(cond_img_emb)
 
     if model.model.conditioning_key == 'hybrid':
         z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
-        img_cat_cond = z[:, :, -1:, :, :]
+        img_cat_cond = z[:, :, -1:, :, :].half()  # Cast to FP16 to match UNet
         img_cat_cond = repeat(img_cat_cond,
                               'b c t h w -> b c (repeat t) h w',
                               repeat=noise_shape[2])
@@ -380,14 +387,18 @@ def image_guided_synthesis_sim_mode(
         prompts = [""] * batch_size
     cond_ins_emb = model.get_learned_conditioning(prompts)
 
-    cond_state_emb = model.state_projector(observation['observation.state'])
-    cond_state_emb = cond_state_emb + model.agent_state_pos_emb
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        cond_state_emb = model.state_projector(observation['observation.state'].half())
+        cond_state_emb = cond_state_emb + model.agent_state_pos_emb
 
-    cond_action_emb = model.action_projector(observation['action'])
-    cond_action_emb = cond_action_emb + model.agent_action_pos_emb
+        cond_action_emb = model.action_projector(observation['action'].half())
+        cond_action_emb = cond_action_emb + model.agent_action_pos_emb
 
     if not sim_mode:
         cond_action_emb = torch.zeros_like(cond_action_emb)
+
+    # Cast text embedding to FP16 to match other conditioning
+    cond_ins_emb = cond_ins_emb.half()
 
     cond["c_crossattn"] = [
         torch.cat(
@@ -422,10 +433,11 @@ def image_guided_synthesis_sim_mode(
             fs=fs,
             timestep_spacing=timestep_spacing,
             guidance_rescale=guidance_rescale,
+            precision=16,
             **kwargs)
 
-        # Reconstruct from latent to pixel space
-        batch_images = model.decode_first_stage(samples)
+        # Reconstruct from latent to pixel space (in FP32 for quality)
+        batch_images = model.decode_first_stage(samples.float())
         batch_variants = batch_images
 
     return batch_variants, actions, states
@@ -471,6 +483,24 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     print(">>> Dataset is successfully loaded ...")
 
     model = model.cuda(gpu_no)
+
+    # ============ FP16 Precision Optimization ============
+    # Convert the main diffusion UNet and related modules to FP16
+    # Keep VAE (first_stage_model) and scheduling buffers in FP32 for stability
+    model.model.diffusion_model.half()          # Video UNet (WMAModel) -> FP16
+    model.model.diffusion_model.dtype = torch.float16  # Set internal dtype flag for WMAModel
+    model.embedder.half()                       # CLIP image encoder -> FP16
+    model.image_proj_model.half()               # Image projector -> FP16
+    model.state_projector.half()                # State projector -> FP16
+    model.action_projector.half()               # Action projector -> FP16
+    model.agent_action_pos_emb.data = model.agent_action_pos_emb.data.half()
+    model.agent_state_pos_emb.data = model.agent_state_pos_emb.data.half()
+    model.cond_pos_emb = model.cond_pos_emb.half()
+    # Keep first_stage_model (VAE) in FP32 for decoding quality
+    # Keep cond_stage_model (CLIP text) in FP32 (it has its own autocast)
+    print(f'>>> Model converted to FP16 for inference acceleration')
+    # ============ End FP16 Optimization ============
+
     device = get_device_from_parameters(model)
 
     # Run over data

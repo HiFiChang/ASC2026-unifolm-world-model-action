@@ -1073,11 +1073,13 @@ class LatentDiffusion(DDPM):
         if not self.perframe_ae:
             encoder_posterior = self.first_stage_model.encode(x)
             results = self.get_first_stage_encoding(encoder_posterior).detach()
-        else:  ## Consume less GPU memory but slower
+        else:  ## Batch encode: process multiple frames at once
+            encode_batch_size = getattr(self, 'encode_batch_size', 4)
             results = []
-            for index in range(x.shape[0]):
-                frame_batch = self.first_stage_model.encode(x[index:index +
-                                                              1, :, :, :])
+            for start_idx in range(0, x.shape[0], encode_batch_size):
+                end_idx = min(start_idx + encode_batch_size, x.shape[0])
+                batch_x = x[start_idx:end_idx, :, :, :]
+                frame_batch = self.first_stage_model.encode(batch_x)
                 frame_result = self.get_first_stage_encoding(
                     frame_batch).detach()
                 results.append(frame_result)
@@ -1109,11 +1111,16 @@ class LatentDiffusion(DDPM):
             z = 1. / self.scale_factor * z
             results = self.first_stage_model.decode(z, **kwargs)
         else:
+            # Batch VAE decode: decode multiple frames at once to reduce overhead
+            # A100 80GB has sufficient memory for batch decode
+            decode_batch_size = getattr(self, 'decode_batch_size', 4)
+            z = 1. / self.scale_factor * z
             results = []
-            for index in range(z.shape[0]):
-                frame_z = 1. / self.scale_factor * z[index:index + 1, :, :, :]
-                frame_result = self.first_stage_model.decode(frame_z, **kwargs)
-                results.append(frame_result)
+            for start_idx in range(0, z.shape[0], decode_batch_size):
+                end_idx = min(start_idx + decode_batch_size, z.shape[0])
+                batch_z = z[start_idx:end_idx, :, :, :]
+                batch_result = self.first_stage_model.decode(batch_z, **kwargs)
+                results.append(batch_result)
             results = torch.cat(results, dim=0)
 
         if reshape_back:
