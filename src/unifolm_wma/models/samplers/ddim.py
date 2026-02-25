@@ -6,6 +6,7 @@ from unifolm_wma.utils.diffusion import make_ddim_sampling_parameters, make_ddim
 from unifolm_wma.utils.common import noise_like
 from unifolm_wma.utils.common import extract_into_tensor
 from tqdm import tqdm
+from unifolm_wma.modules.attention import enable_kv_cache, disable_kv_cache, clear_kv_cache
 
 
 class DDIMSampler(object):
@@ -244,6 +245,8 @@ class DDIMSampler(object):
 
         dp_ddim_scheduler_action.set_timesteps(len(timesteps))
         dp_ddim_scheduler_state.set_timesteps(len(timesteps))
+        clear_kv_cache()
+        enable_kv_cache()
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((b, ), step, device=device, dtype=torch.long)
@@ -303,6 +306,8 @@ class DDIMSampler(object):
                 intermediates['x_inter_action'].append(action)
                 intermediates['x_inter_state'].append(state)
 
+        clear_kv_cache()
+        disable_kv_cache()
         return img, action, state, intermediates
 
     @torch.no_grad()

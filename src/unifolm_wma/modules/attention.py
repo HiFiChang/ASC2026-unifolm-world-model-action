@@ -20,6 +20,29 @@ from unifolm_wma.utils.common import (
 from unifolm_wma.utils.basics import zero_module
 
 
+# ---------------------------------------------------------------------------
+# KV Cache: reuse cross-attention K,V across all DDIM steps (context is fixed)
+# ---------------------------------------------------------------------------
+_kv_cache: dict = {}
+_kv_cache_enabled: bool = False
+
+
+def enable_kv_cache():
+    global _kv_cache_enabled
+    _kv_cache_enabled = True
+
+
+def disable_kv_cache():
+    global _kv_cache_enabled
+    _kv_cache_enabled = False
+
+
+def clear_kv_cache():
+    global _kv_cache
+    _kv_cache.clear()
+# ---------------------------------------------------------------------------
+
+
 class RelativePosition(nn.Module):
     """ https://github.com/evelinehong/Transformer_Relative_Position_PyTorch/blob/master/relative_position.py """
 
@@ -236,11 +259,27 @@ class CrossAttention(nn.Module):
         k_ip, v_ip, out_ip = None, None, None
         k_as, v_as, out_as = None, None, None
         k_aa, v_aa, out_aa = None, None, None
+        attn_mask_aa = None
 
         q = self.to_q(x)
         context = default(context, x)
 
-        if self.image_cross_attention and not spatial_self_attn:
+        _cache_key = id(self)
+        _use_cache = _kv_cache_enabled and not spatial_self_attn
+        _cache_hit = _use_cache and _cache_key in _kv_cache
+
+        if _cache_hit:
+            _cached = _kv_cache[_cache_key]
+            k = _cached['k']
+            v = _cached['v']
+            k_ip = _cached['k_ip']
+            v_ip = _cached['v_ip']
+            k_as = _cached['k_as']
+            v_as = _cached['v_as']
+            k_aa = _cached['k_aa']
+            v_aa = _cached['v_aa']
+            attn_mask_aa = _cached['attn_mask_aa']
+        elif self.image_cross_attention and not spatial_self_attn:
             if context.shape[1] == self.text_context_len + self.video_length:
                 context_ins, context_image = context[:, :self.text_context_len, :], context[:,self.text_context_len:, :]
                 k = self.to_k(context)
@@ -282,6 +321,13 @@ class CrossAttention(nn.Module):
                 context = context[:, :self.text_context_len, :]
             k = self.to_k(context)
             v = self.to_v(context)
+
+        if _use_cache and not _cache_hit:
+            _kv_cache[_cache_key] = {
+                'k': k, 'v': v, 'k_ip': k_ip, 'v_ip': v_ip,
+                'k_as': k_as, 'v_as': v_as, 'k_aa': k_aa, 'v_aa': v_aa,
+                'attn_mask_aa': attn_mask_aa,
+            }
 
         b, _, _ = q.shape
         q = q.unsqueeze(3).reshape(b, q.shape[1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(b * self.heads, q.shape[1], self.dim_head).contiguous()
