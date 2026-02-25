@@ -332,6 +332,7 @@ def image_guided_synthesis_sim_mode(
         timestep_spacing: str = 'uniform',
         guidance_rescale: float = 0.0,
         sim_mode: bool = True,
+        ddim_sampler=None,
         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs image-guided video generation in a simulation-style mode with optional multimodal guidance (image, state, action, text).
@@ -363,7 +364,10 @@ def image_guided_synthesis_sim_mode(
         states (torch.Tensor): Predicted state sequences [B, T, D] from diffusion decoding.
     """
     b, _, t, _, _ = noise_shape
-    ddim_sampler = DDIMSampler(model)
+    # Reuse a pre-built DDIMSampler to avoid re-computing the DDIM schedule
+    # (make_schedule + register_buffer to CUDA) on every call.
+    if ddim_sampler is None:
+        ddim_sampler = DDIMSampler(model)
     batch_size = noise_shape[0]
 
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
@@ -501,6 +505,12 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     print(f'>>> Model converted to FP16 for inference acceleration')
     # ============ End FP16 Optimization ============
 
+    # ============ DDIMSampler Schedule Caching ============
+    # Pre-build a single DDIMSampler and pre-run make_schedule so the 22× calls
+    # to image_guided_synthesis_sim_mode can skip the redundant schedule computation.
+    _ddim_sampler_cache = DDIMSampler(model)
+    # ============ End DDIMSampler Schedule Caching ============
+
     device = get_device_from_parameters(model)
 
     # Run over data
@@ -617,6 +627,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     fs=model_input_fs,
                     timestep_spacing=args.timestep_spacing,
                     guidance_rescale=args.guidance_rescale,
+                    ddim_sampler=_ddim_sampler_cache,
                     sim_mode=False)
 
                 # Update future actions in the observation queues
@@ -658,7 +669,8 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     fs=model_input_fs,
                     text_input=False,
                     timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale)
+                    guidance_rescale=args.guidance_rescale,
+                    ddim_sampler=_ddim_sampler_cache)
 
                 for idx in range(args.exe_steps):
                     observation = {

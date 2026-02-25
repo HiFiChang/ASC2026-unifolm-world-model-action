@@ -29,6 +29,17 @@ class DDIMSampler(object):
                       ddim_discretize="uniform",
                       ddim_eta=0.,
                       verbose=True):
+        # ---- Schedule caching -----------------------------------------------
+        # The schedule depends only on (ddim_num_steps, ddim_discretize, ddim_eta).
+        # Caching avoids repeating the CPU numpy computation + CUDA register_buffer
+        # every time `sample()` is called with the same parameters, which would
+        # happen 22 times in a single inference run.
+        _sched_key = (ddim_num_steps, ddim_discretize, ddim_eta)
+        if getattr(self, '_schedule_key', None) == _sched_key:
+            return  # Already built with identical params – reuse.
+        self._schedule_key = _sched_key
+        # ---- End caching header ---------------------------------------------
+
         self.ddim_timesteps = make_ddim_timesteps(
             ddim_discr_method=ddim_discretize,
             num_ddim_timesteps=ddim_num_steps,
