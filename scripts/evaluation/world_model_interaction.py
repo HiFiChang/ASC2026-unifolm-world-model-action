@@ -333,6 +333,7 @@ def image_guided_synthesis_sim_mode(
         guidance_rescale: float = 0.0,
         sim_mode: bool = True,
         ddim_sampler=None,
+        cond_ins_emb_cache=None,
         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs image-guided video generation in a simulation-style mode with optional multimodal guidance (image, state, action, text).
@@ -380,7 +381,10 @@ def image_guided_synthesis_sim_mode(
         cond_img_emb = model.image_proj_model(cond_img_emb)
 
     if model.model.conditioning_key == 'hybrid':
-        z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
+        # Only encode the last observation frame – img_cat_cond uses z[:, :, -1:, :, :]
+        # so encoding all n_obs_steps_imagen frames is wasteful.
+        last_img = img[:, -1:, :, :, :]  # (b, 1, c, H, W)
+        z = get_latent_z(model, last_img.permute(0, 2, 1, 3, 4))
         img_cat_cond = z[:, :, -1:, :, :].half()  # Cast to FP16 to match UNet
         img_cat_cond = repeat(img_cat_cond,
                               'b c t h w -> b c (repeat t) h w',
@@ -389,7 +393,11 @@ def image_guided_synthesis_sim_mode(
 
     if not text_input:
         prompts = [""] * batch_size
-    cond_ins_emb = model.get_learned_conditioning(prompts)
+    # Reuse pre-computed text embedding if caller provides one (avoids repeated CLIP text encode)
+    if cond_ins_emb_cache is not None:
+        cond_ins_emb = cond_ins_emb_cache
+    else:
+        cond_ins_emb = model.get_learned_conditioning(prompts)
 
     with torch.autocast(device_type='cuda', dtype=torch.float16):
         cond_state_emb = model.state_projector(observation['observation.state'].half())
@@ -539,6 +547,21 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
         os.makedirs(video_save_dir + '/dm', exist_ok=True)
         os.makedirs(video_save_dir + '/wm', exist_ok=True)
 
+        # ---- Pre-compute text embeddings once per sample ----
+        # Phase A (sim_mode=False) always uses the same instruction text;
+        # Phase B (text_input=False) always uses [""].  Both are static across
+        # all n_iter iterations so we can avoid 22 × CLIP text encoder calls.
+        with torch.no_grad():
+            _cond_ins_emb_a = model.get_learned_conditioning(
+                [sample['instruction']]).half()
+            _cond_ins_emb_b = model.get_learned_conditioning([""] * args.bs).half()
+        # ---- End text embedding pre-computation ----
+
+        video_save_dir = args.savedir + f"/inference/sample_{sample['videoid']}"
+        os.makedirs(video_save_dir, exist_ok=True)
+        os.makedirs(video_save_dir + '/dm', exist_ok=True)
+        os.makedirs(video_save_dir + '/wm', exist_ok=True)
+
         # Load transitions to get the initial state later
         transition_path = get_transition_path(args.prompt_dir, sample)
         with h5py.File(transition_path, 'r') as h5f:
@@ -628,6 +651,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     timestep_spacing=args.timestep_spacing,
                     guidance_rescale=args.guidance_rescale,
                     ddim_sampler=_ddim_sampler_cache,
+                    cond_ins_emb_cache=_cond_ins_emb_a,
                     sim_mode=False)
 
                 # Update future actions in the observation queues
@@ -670,7 +694,8 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     text_input=False,
                     timestep_spacing=args.timestep_spacing,
                     guidance_rescale=args.guidance_rescale,
-                    ddim_sampler=_ddim_sampler_cache)
+                    ddim_sampler=_ddim_sampler_cache,
+                    cond_ins_emb_cache=_cond_ins_emb_b)
 
                 for idx in range(args.exe_steps):
                     observation = {
